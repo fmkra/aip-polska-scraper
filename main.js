@@ -14,6 +14,64 @@ const HEADERS = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 };
 
+// Optional insecure TLS fallback (off by default). Enable with ALLOW_INSECURE_TLS=1
+const ALLOW_INSECURE_TLS =
+  process.env.ALLOW_INSECURE_TLS === "1" || process.env.ALLOW_INSECURE_TLS === "true";
+
+async function curlFetchText(url) {
+  const args = [
+    "curl",
+    "-fsSL",
+    "--insecure",
+    "-H",
+    `User-Agent: ${HEADERS["User-Agent"]}`,
+    url,
+  ];
+  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    const errOut = await new Response(proc.stderr).text();
+    throw new Error(`curl failed (${exitCode}): ${errOut.trim()}`);
+  }
+  return await new Response(proc.stdout).text();
+}
+
+async function curlDownload(url, targetPath) {
+  const args = [
+    "curl",
+    "-fsSL",
+    "--insecure",
+    "-H",
+    `User-Agent: ${HEADERS["User-Agent"]}`,
+    "-o",
+    targetPath,
+    url,
+  ];
+  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const exitCode = await proc.exited;
+  return exitCode === 0;
+}
+
+async function fetchTextWithTlsFallback(url) {
+  try {
+    const response = await fetch(url, { headers: HEADERS });
+    if (!response.ok) {
+      throw new Error(`HTTP error ${response.status}`);
+    }
+    return await response.text();
+  } catch (error) {
+    const message = error?.message || "";
+    if (
+      ALLOW_INSECURE_TLS &&
+      /unable to verify the first certificate|certificate/i.test(message)
+    ) {
+      console.warn(`TLS verification failed for ${url}, retrying insecurely via curl`);
+      return await curlFetchText(url);
+    }
+    throw error;
+  }
+}
+
 function sanitizeFilename(name) {
   if (!name || typeof name !== "string") {
     return "untitled";
@@ -37,10 +95,22 @@ async function downloadFile(url, targetPath) {
         `Failed to download ${url}: ${response.status} ${response.statusText}`
       );
     }
-    await Bun.write(targetPath, response);
+    await Bun.write(targetPath, await response.blob());
     console.log(`    Saved to: ${targetPath}`);
     return true;
   } catch (error) {
+    const message = error?.message || "";
+    if (
+      ALLOW_INSECURE_TLS &&
+      /unable to verify the first certificate|certificate/i.test(message)
+    ) {
+      console.warn(`    TLS verification failed, retrying insecurely via curl for ${url}`);
+      const ok = await curlDownload(url, targetPath);
+      if (ok) {
+        console.log(`    Saved to: ${targetPath} (via curl --insecure)`);
+        return true;
+      }
+    }
     console.error(`    Error downloading ${url}: ${error.message}`);
     return false;
   }
@@ -59,12 +129,13 @@ async function processMenuItems(
 
     try {
       await mkdir(currentFsPath, { recursive: true });
-      console.log(`  Created directory: ${currentFsPath}`);
+      // console.log(`  Created directory: ${currentFsPath}`);
     } catch (error) {
       console.error(`  Error creating directory ${currentFsPath}: ${error.message}`);
       continue;
     }
 
+    let allChildrenSameFile = true;
     const href = item.href;
     if (href) {
       const pdfNameMatch = href.match(/^(.*?)(?:-[a-z]{2}-[A-Z]{2})?\.html/);
@@ -83,7 +154,14 @@ async function processMenuItems(
           }
         }
 
-        const pdfTargetPath = item.children.length > 0 ?  `${itemPath}/${sanitizedItemTitle}.pdf` : `${itemPath}.pdf`;
+        for(const child of item.children) {
+          if(child.href && child.href.split('#')[0] !== href.split('#')[0] || child.children.length > 0) {
+            allChildrenSameFile = false;
+            break;
+          }
+        }
+
+        const pdfTargetPath = item.children.length > 0 && !allChildrenSameFile ?  `${itemPath}/${sanitizedItemTitle}.pdf` : `${itemPath}.pdf`;
 
         if(!hasDuplicateInSubtree) {
           await downloadFile(pdfUrl, pdfTargetPath);
@@ -91,7 +169,7 @@ async function processMenuItems(
       }
     }
 
-    if (item.children && item.children.length > 0) {
+    if (item.children && item.children.length > 0 && !allChildrenSameFile) {
       await processMenuItems(
         item.children,
         itemPath,
@@ -114,11 +192,7 @@ async function main() {
   let mainPageHtml;
   try {
     console.log(`Fetching main AIP page: ${BASE_URL}`);
-    const response = await fetch(BASE_URL, { headers: HEADERS });
-    if (!response.ok) {
-      throw new Error(`HTTP error ${response.status}`);
-    }
-    mainPageHtml = await response.text();
+    mainPageHtml = await fetchTextWithTlsFallback(BASE_URL);
   } catch (error) {
     console.error(`Error fetching main page ${BASE_URL}: ${error.message}`);
     return;
@@ -151,11 +225,7 @@ async function main() {
     console.log(`\n--- Processing ${typeKey} from ${eaipEntryPageUrl} ---`);
     let eaipPageHtml;
     try {
-      const response = await fetch(eaipEntryPageUrl, { headers: HEADERS });
-      if (!response.ok) {
-        throw new Error(`HTTP error ${response.status}`);
-      }
-      eaipPageHtml = await response.text();
+      eaipPageHtml = await fetchTextWithTlsFallback(eaipEntryPageUrl);
     } catch (error) {
       console.error(
         `Error fetching ${typeKey} page ${eaipEntryPageUrl}: ${error.message}`
@@ -270,7 +340,7 @@ async function main() {
     const eaipTypeBaseUrl = TARGET_LINK_PREFIXES[typeKey];
     const encodedAmdtFolderName = encodeURIComponent(amdtFolderName);
 
-    const amendmentContentBaseUrl = `${eaipTypeBaseUrl.replace(/\/$/, "")}/${dateForUrlPath}/${encodedAmdtFolderName}/`;
+    const amendmentContentBaseUrl = `${eaipTypeBaseUrl.replace(/\/$/, "")}/${encodedAmdtFolderName}/`;
     const datasourceJsUrl = new URL("v2/js/datasource.js", amendmentContentBaseUrl).href;
     const pdfDocumentBaseUrl = new URL("documents/PDF/", amendmentContentBaseUrl).href; 
 
@@ -279,11 +349,7 @@ async function main() {
 
     let jsContent;
     try {
-      const response = await fetch(datasourceJsUrl, { headers: HEADERS });
-      if (!response.ok) {
-        throw new Error(`HTTP error ${response.status}`);
-      }
-      jsContent = await response.text();
+      jsContent = await fetchTextWithTlsFallback(datasourceJsUrl);
     } catch (error) {
       console.error(
         `Error fetching datasource.js for ${typeKey}: ${error.message}`
